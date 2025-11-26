@@ -1,0 +1,178 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// --- CREDENCIALES ---
+const char* ssid = "David"; 
+const char* password = "david091";
+const char* mqtt_server = "172.20.10.2";
+const int mqtt_port = 1883;
+
+// --- TOPICS ---
+const char* TOPIC_RFID = "rfid/valid";
+const char* TOPIC_FACIAL = "facial/valid";
+
+// --- PINES ---
+#define SS_PIN 5
+#define RST_PIN 22
+#define ACCESS_PIN 2  
+#define LED_GREEN 16  
+#define LED_RED 4     
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+
+unsigned long relayTimer = 0;
+bool isDoorOpen = false;
+const unsigned long DOOR_OPEN_TIME = 3000; // 3 segundos
+unsigned long last_rfid_read = 0;
+
+
+unsigned long ledTimer = 0;
+bool isLedActive = false;
+const unsigned long LED_DISPLAY_TIME = 3000; // 3 segundos mostrando el LED
+
+void setup_wifi() {
+  delay(10);
+  Serial.print("Conectando a WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi Conectado IP: " + WiFi.localIP().toString());
+}
+
+// --- CALLBACK: RECIBE ORDENES DE PYTHON ---
+void callback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  
+  Serial.println("📩 Mensaje recibido: " + msg);
+
+  StaticJsonDocument<200> doc;
+  DeserializationError error = deserializeJson(doc, msg);
+
+  if (error) {
+    Serial.println("❌ JSON inválido");
+    return;
+  }
+
+  const char* command = doc["command"]; // "open" o "deny"
+  
+  if (strcmp(command, "open") == 0) {
+    const char* user = doc["user"];
+    Serial.printf("✅ ACCESO CONCEDIDO a: %s\n", user);
+    
+    // Apagar LED rojo y encender LED verde
+    digitalWrite(LED_RED, LOW);
+    digitalWrite(LED_GREEN, HIGH);
+    isLedActive = true;
+    ledTimer = millis();
+    
+    // Activar relé
+    digitalWrite(ACCESS_PIN, HIGH);
+    isDoorOpen = true;
+    relayTimer = millis();
+  } else {
+    Serial.println("⛔ ACCESO DENEGADO");
+    
+    // Apagar LED verde y encender LED rojo
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_RED, HIGH);
+    isLedActive = true;
+    ledTimer = millis();
+  }
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("🔄 Conectando MQTT...");
+    String clientId = "ESP32Client-";
+    clientId += String(random(0xffff), HEX);
+    
+    if (client.connect(clientId.c_str())) {
+      Serial.println("conectado!");
+      client.subscribe(TOPIC_FACIAL);
+    } else {
+      Serial.print("falló rc=");
+      Serial.print(client.state());
+      Serial.println(" reintentando en 5s");
+      delay(5000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(ACCESS_PIN, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  
+  digitalWrite(ACCESS_PIN, LOW);
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_RED, LOW);
+
+  SPI.begin();
+  mfrc522.PCD_Init();
+
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  
+  Serial.println("🔹 Sistema listo. Esperando tarjeta...");
+}
+
+void loop() {
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  // 1. MANEJO NO BLOQUEANTE DEL RELÉ
+  if (isDoorOpen && (millis() - relayTimer >= DOOR_OPEN_TIME)) {
+    digitalWrite(ACCESS_PIN, LOW);
+    isDoorOpen = false;
+    Serial.println("🔒 Puerta cerrada automáticamente");
+  }
+
+  // 2. MANEJO NO BLOQUEANTE DE LOS LEDs
+  if (isLedActive && (millis() - ledTimer >= LED_DISPLAY_TIME)) {
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_RED, LOW);
+    isLedActive = false;
+    Serial.println("💡 LEDs apagados");
+  }
+
+  // 3. LECTURA RFID (Con debounce de 2 segundos)
+  if (millis() - last_rfid_read > 2000) {
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      last_rfid_read = millis();
+      
+      String id_hex = "";
+      for (byte i = 0; i < mfrc522.uid.size; i++) {
+        id_hex += (mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
+        id_hex += String(mfrc522.uid.uidByte[i], HEX);
+      }
+      id_hex.toUpperCase();
+
+      Serial.println("\n💳 Tarjeta leída: " + id_hex);
+
+      // Enviar a Python
+      StaticJsonDocument<200> doc;
+      doc["card_id"] = id_hex;
+      char buffer[200];
+      serializeJson(doc, buffer);
+      
+      client.publish(TOPIC_RFID, buffer);
+      Serial.println("📤 Enviado a validación...");
+      
+      // Detener comunicación con la tarjeta actual
+      mfrc522.PICC_HaltA(); 
+      mfrc522.PCD_StopCrypto1(); 
+    }
+  }
+}
